@@ -1,194 +1,162 @@
 """
-ui/server.py — Lightweight Flask web UI for the trading bot.
+Low-level Binance Futures Testnet REST client.
 
-Run with:
-    python ui/server.py
-
-Then open http://localhost:5000 in your browser.
-Credentials are passed via environment variables or the settings form in the UI.
+Handles:
+  - HMAC-SHA256 request signing
+  - Timestamp synchronisation
+  - HTTP requests with timeout & retry
+  - Structured logging of every request/response
 """
 
 from __future__ import annotations
 
-import os
-import sys
-import json
-from decimal import Decimal
-from typing import Any, Dict
+import hashlib
+import hmac
+import time
+from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
-from flask import Flask, jsonify, render_template, request, session
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Make the parent package importable when run from project root
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bot.logging_config import setup_logger
 
-from bot.credentials import load_credentials, save_credentials, clear_credentials, credentials_source
-from bot.advanced_orders import (
-    place_grid_order,
-    place_oco_order,
-    place_stop_limit_order,
-    place_twap_order,
-)
-from bot.client import BinanceClient, BinanceClientError
-from bot.orders import place_limit_order, place_market_order, place_stop_market_order
-from bot.validators import (
-    validate_order_type,
-    validate_price,
-    validate_quantity,
-    validate_side,
-    validate_stop_price,
-    validate_symbol,
-)
-
-app = Flask(__name__, template_folder="templates")
-app.secret_key = os.urandom(24)
+BASE_URL = "https://testnet.binancefuture.com"
+RECV_WINDOW = 5000  # ms
 
 
-def _get_client() -> BinanceClient:
-    # Priority: session (user entered in UI) → saved file / env vars
-    api_key    = session.get("api_key",    "").strip()
-    api_secret = session.get("api_secret", "").strip()
-    if not api_key or not api_secret:
-        api_key, api_secret = load_credentials()
-    if not api_key or not api_secret:
-        raise ValueError("API credentials not configured. Use the Settings panel to save them.")
-    return BinanceClient(api_key, api_secret)
+class BinanceClientError(Exception):
+    """Raised when the Binance API returns an error response."""
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"Binance API error {code}: {message}")
 
 
-def _ok(data: Any) -> Any:
-    return jsonify({"status": "ok", "data": data})
+class BinanceClient:
+    """
+    Thin wrapper around the Binance Futures Testnet REST API.
 
+    All signed endpoints automatically attach a timestamp and HMAC
+    signature.  Responses are logged at DEBUG level; errors at ERROR.
+    """
 
-def _err(msg: str, code: int = 400) -> Any:
-    return jsonify({"status": "error", "message": msg}), code
+    def __init__(self, api_key: str, api_secret: str, log_dir: str = "logs") -> None:
+        self._api_key = api_key
+        self._api_secret = api_secret.encode()
+        self.logger = setup_logger("binance_client", log_dir)
 
+        # Session with retry logic (network-level failures)
+        self._session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.headers.update({"X-MBX-APIKEY": self._api_key})
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
+    def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Append timestamp + HMAC-SHA256 signature to params dict."""
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = RECV_WINDOW
+        query = urlencode(params)
+        sig = hmac.new(self._api_secret, query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        return params
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        signed: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Execute an HTTP request, log it, and return the parsed JSON body.
 
+        Raises:
+            BinanceClientError: On non-2xx API responses with a JSON error body.
+            requests.RequestException: On network / timeout failures.
+        """
+        params = params or {}
+        if signed:
+            params = self._sign(params)
 
-@app.route("/api/credentials", methods=["GET"])
-def get_credential_status():
-    """Return current credential source (never returns the actual values)."""
-    source = credentials_source()
-    api_key, _ = load_credentials()
-    return _ok({"source": source, "configured": bool(api_key)})
+        url = BASE_URL + path
+        self.logger.debug("REQUEST  %s %s  params=%s", method.upper(), url, params)
 
+        resp = self._session.request(method, url, params=params, timeout=10)
 
-@app.route("/api/credentials", methods=["POST"])
-def set_credentials():
-    body      = request.get_json(force=True)
-    api_key   = body.get("api_key",   "").strip()
-    api_secret = body.get("api_secret", "").strip()
-    persist   = body.get("save", False)
+        self.logger.debug(
+            "RESPONSE %s %s  status=%d  body=%s",
+            method.upper(),
+            url,
+            resp.status_code,
+            resp.text[:2000],  # truncate very long bodies
+        )
 
-    session["api_key"]    = api_key
-    session["api_secret"] = api_secret
+        data = resp.json()
 
-    # Optionally persist to disk
-    if persist and api_key and api_secret:
-        save_credentials(api_key, api_secret)
+        # Binance returns errors as {"code": <negative int>, "msg": "..."}
+        if isinstance(data, dict) and data.get("code", 0) < 0:
+            self.logger.error(
+                "API error — code=%s  msg=%s", data.get("code"), data.get("msg")
+            )
+            raise BinanceClientError(data["code"], data.get("msg", "Unknown error"))
 
-    # Quick ping to validate
-    try:
-        client = _get_client()
-        ts = client.get_server_time()
-        return _ok({"server_time": ts, "saved": persist, "source": credentials_source()})
-    except Exception as exc:
-        return _err(str(exc))
+        if not resp.ok:
+            self.logger.error("HTTP error %d: %s", resp.status_code, resp.text)
+            resp.raise_for_status()
 
+        return data
 
-@app.route("/api/credentials", methods=["DELETE"])
-def delete_credentials():
-    """Clear saved credentials from disk and session."""
-    session.pop("api_key",    None)
-    session.pop("api_secret", None)
-    cleared = clear_credentials()
-    return _ok({"cleared": cleared})
+    # ------------------------------------------------------------------
+    # Public API methods
+    # ------------------------------------------------------------------
 
+    def get_server_time(self) -> int:
+        """Return Binance server time in milliseconds (unauthenticated)."""
+        data = self._request("GET", "/fapi/v1/time", signed=False)
+        return data["serverTime"]
 
-@app.route("/api/order", methods=["POST"])
-def place_order():
-    body = request.get_json(force=True)
+    def get_account(self) -> Dict[str, Any]:
+        """Return futures account information."""
+        return self._request("GET", "/fapi/v2/account")
 
-    try:
-        client     = _get_client()
-        symbol     = validate_symbol(body.get("symbol", ""))
-        side       = validate_side(body.get("side", ""))
-        order_type = validate_order_type(body.get("order_type", ""))
-        quantity   = validate_quantity(body.get("quantity", ""))
-    except ValueError as exc:
-        return _err(str(exc))
+    def get_exchange_info(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Return exchange info, optionally filtered to a single symbol."""
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        return self._request("GET", "/fapi/v1/exchangeInfo", params=params, signed=False)
 
-    try:
-        resp: Any
+    def place_order(self, **kwargs: Any) -> Dict[str, Any]:
+        """
+        Place a new order.
 
-        if order_type == "MARKET":
-            resp = place_market_order(client, symbol, side, quantity)
+        Keyword args mirror the Binance /fapi/v1/order POST parameters,
+        e.g. symbol, side, type, quantity, price, timeInForce, stopPrice.
+        """
+        return self._request("POST", "/fapi/v1/order", params=kwargs)
 
-        elif order_type == "LIMIT":
-            price = validate_price(body.get("price"), order_type)
-            tif   = body.get("time_in_force", "GTC").upper()
-            resp  = place_limit_order(client, symbol, side, quantity, price, tif)
+    def get_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """Query a specific order by orderId."""
+        return self._request("GET", "/fapi/v1/order", params={"symbol": symbol, "orderId": order_id})
 
-        elif order_type == "STOP_MARKET":
-            stop_price = validate_stop_price(body.get("stop_price"), order_type)
-            resp = place_stop_market_order(client, symbol, side, quantity, stop_price)
+    def place_order_raw(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a signed request to an arbitrary order endpoint (e.g. OCO)."""
+        return self._request(method, path, params=params)
 
-        elif order_type == "STOP_LIMIT":
-            price      = validate_quantity(body.get("price", ""))
-            stop_price = validate_quantity(body.get("stop_price", ""))
-            tif        = body.get("time_in_force", "GTC").upper()
-            resp = place_stop_limit_order(client, symbol, side, quantity, price, stop_price, tif)
-
-        elif order_type == "OCO":
-            tp_price  = validate_quantity(body.get("price", ""))
-            stop_trig = validate_quantity(body.get("stop_price", ""))
-            stop_lim  = validate_quantity(body.get("stop_limit_price", ""))
-            resp = place_oco_order(client, symbol, side, quantity, tp_price, stop_trig, stop_lim)
-
-        elif order_type == "TWAP":
-            slices   = int(body.get("slices",   5))
-            interval = int(body.get("interval", 10))
-            ct       = body.get("child_type", "MARKET").upper()
-            price    = validate_quantity(body.get("price")) if ct == "LIMIT" else None
-            resp = place_twap_order(client, symbol, side, quantity, slices, interval, ct, price)
-
-        elif order_type == "GRID":
-            levels   = int(body.get("levels",    5))
-            start    = validate_quantity(body.get("start_price",    ""))
-            step     = validate_quantity(body.get("step",           ""))
-            resp = place_grid_order(client, symbol, side, quantity, levels, start, step)
-
-        else:
-            return _err(f"Unsupported order type: {order_type}")
-
-    except BinanceClientError as exc:
-        return _err(f"Binance API error {exc.code}: {exc.message}")
-    except ValueError as exc:
-        return _err(str(exc))
-    except Exception as exc:
-        return _err(f"Unexpected error: {exc}", 500)
-
-    # Serialise Decimal values
-    def _serialise(obj):
-        if isinstance(obj, Decimal):
-            return str(obj)
-        if isinstance(obj, list):
-            return [_serialise(x) for x in obj]
-        if isinstance(obj, dict):
-            return {k: _serialise(v) for k, v in obj.items()}
-        return obj
-
-    return _ok(_serialise(resp))
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"\n  ⬡  Trading Bot UI  →  http://localhost:{port}\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """Cancel an open order."""
+        return self._request(
+            "DELETE", "/fapi/v1/order", params={"symbol": symbol, "orderId": order_id}
+        )

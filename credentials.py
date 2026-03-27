@@ -1,225 +1,350 @@
 """
-Order placement logic — sits between the CLI and the raw BinanceClient.
+Advanced order types: Stop-Limit, OCO, TWAP, Grid.
 
-Responsibilities:
-  - Build correct parameter dictionaries for each order type.
-  - Format and print order summaries and responses.
-  - Catch and re-raise errors with context.
+Each function follows the same contract as the base orders:
+  - accepts a BinanceClient + validated params
+  - logs at INFO / DEBUG
+  - prints a formatted summary + response
+  - raises BinanceClientError on API failure
 """
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from bot.client import BinanceClient, BinanceClientError
 from bot.logging_config import setup_logger
 
-logger = setup_logger("orders")
+logger = setup_logger("advanced_orders")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 
-def _fmt(value: Any, decimals: int = 8) -> str:
-    """Format a numeric value to `decimals` significant decimal places."""
-    try:
-        return f"{Decimal(str(value)):.{decimals}f}".rstrip("0").rstrip(".")
-    except Exception:
-        return str(value)
+def _print_block(title: str, rows: List[tuple]) -> None:
+    width = 52
+    print("\n" + "=" * width)
+    print(f"  {title}")
+    print("=" * width)
+    for label, value in rows:
+        if value not in (None, "", "—"):
+            print(f"  {label:<22}: {value}")
+    print("=" * width)
 
 
-def _print_order_summary(params: Dict[str, Any]) -> None:
-    """Pretty-print the order request parameters before submission."""
-    print("\n" + "=" * 52)
-    print("  ORDER REQUEST SUMMARY")
-    print("=" * 52)
-    for key, val in params.items():
-        print(f"  {key:<18}: {val}")
-    print("=" * 52)
-
-
-def _print_order_response(resp: Dict[str, Any]) -> None:
-    """Pretty-print the key fields from an order response."""
-    print("\n" + "=" * 52)
-    print("  ORDER RESPONSE")
-    print("=" * 52)
-
-    fields = [
-        ("orderId",      resp.get("orderId",      "—")),
-        ("symbol",       resp.get("symbol",       "—")),
-        ("side",         resp.get("side",         "—")),
-        ("type",         resp.get("type",         "—")),
-        ("status",       resp.get("status",       "—")),
-        ("origQty",      resp.get("origQty",      "—")),
-        ("executedQty",  resp.get("executedQty",  "—")),
-        ("avgPrice",     resp.get("avgPrice",     "—")),
-        ("price",        resp.get("price",        "—")),
-        ("stopPrice",    resp.get("stopPrice",    "—")),
-        ("timeInForce",  resp.get("timeInForce",  "—")),
-        ("updateTime",   resp.get("updateTime",   "—")),
+def _response_rows(resp: Dict[str, Any]) -> List[tuple]:
+    return [
+        ("orderId",    resp.get("orderId",    "—")),
+        ("symbol",     resp.get("symbol",     "—")),
+        ("side",       resp.get("side",       "—")),
+        ("type",       resp.get("type",       "—")),
+        ("status",     resp.get("status",     "—")),
+        ("origQty",    resp.get("origQty",    "—")),
+        ("executedQty",resp.get("executedQty","—")),
+        ("avgPrice",   resp.get("avgPrice",   "—")),
+        ("price",      resp.get("price",      "—")),
+        ("stopPrice",  resp.get("stopPrice",  "—")),
+        ("timeInForce",resp.get("timeInForce","—")),
     ]
-    for label, value in fields:
-        if value not in ("", "0", "0.00000000", None, "—") or label in ("orderId", "status"):
-            print(f"  {label:<18}: {value}")
-
-    print("=" * 52)
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# 1. STOP-LIMIT
 # ---------------------------------------------------------------------------
 
 
-def place_market_order(
-    client: BinanceClient,
-    symbol: str,
-    side: str,
-    quantity: Decimal,
-) -> Dict[str, Any]:
-    """
-    Place a MARKET order on Binance Futures Testnet.
-
-    Args:
-        client:   Authenticated BinanceClient instance.
-        symbol:   Trading pair, e.g. "BTCUSDT".
-        side:     "BUY" or "SELL".
-        quantity: Order quantity (base asset).
-
-    Returns:
-        Raw order response dict from the API.
-    """
-    params: Dict[str, Any] = {
-        "symbol":   symbol,
-        "side":     side,
-        "type":     "MARKET",
-        "quantity": str(quantity),
-    }
-
-    logger.info("Placing MARKET order — %s %s qty=%s", side, symbol, quantity)
-    _print_order_summary(params)
-
-    try:
-        resp = client.place_order(**params)
-    except BinanceClientError as exc:
-        logger.error("MARKET order failed — %s", exc)
-        print(f"\n✗  Order FAILED: {exc}")
-        raise
-
-    logger.info(
-        "MARKET order placed — orderId=%s status=%s executedQty=%s avgPrice=%s",
-        resp.get("orderId"),
-        resp.get("status"),
-        resp.get("executedQty"),
-        resp.get("avgPrice"),
-    )
-    _print_order_response(resp)
-    print("\n✔  Order placed successfully!")
-    return resp
-
-
-def place_limit_order(
+def place_stop_limit_order(
     client: BinanceClient,
     symbol: str,
     side: str,
     quantity: Decimal,
     price: Decimal,
+    stop_price: Decimal,
     time_in_force: str = "GTC",
 ) -> Dict[str, Any]:
     """
-    Place a LIMIT order on Binance Futures Testnet.
+    STOP order with a LIMIT fill price.
 
-    Args:
-        client:        Authenticated BinanceClient instance.
-        symbol:        Trading pair, e.g. "BTCUSDT".
-        side:          "BUY" or "SELL".
-        quantity:      Order quantity (base asset).
-        price:         Limit price.
-        time_in_force: "GTC" (default), "IOC", or "FOK".
-
-    Returns:
-        Raw order response dict from the API.
+    The order is triggered when the market reaches `stop_price`,
+    then placed as a LIMIT order at `price`.
     """
     params: Dict[str, Any] = {
         "symbol":      symbol,
         "side":        side,
-        "type":        "LIMIT",
+        "type":        "STOP",
         "quantity":    str(quantity),
         "price":       str(price),
+        "stopPrice":   str(stop_price),
         "timeInForce": time_in_force,
     }
 
     logger.info(
-        "Placing LIMIT order — %s %s qty=%s price=%s tif=%s",
-        side, symbol, quantity, price, time_in_force,
+        "Placing STOP_LIMIT order — %s %s qty=%s price=%s stopPrice=%s",
+        side, symbol, quantity, price, stop_price,
     )
-    _print_order_summary(params)
+    _print_block("STOP-LIMIT ORDER REQUEST", [
+        ("symbol",       symbol),
+        ("side",         side),
+        ("quantity",     quantity),
+        ("limit price",  price),
+        ("stop trigger", stop_price),
+        ("timeInForce",  time_in_force),
+    ])
 
     try:
         resp = client.place_order(**params)
     except BinanceClientError as exc:
-        logger.error("LIMIT order failed — %s", exc)
+        logger.error("STOP_LIMIT order failed — %s", exc)
         print(f"\n✗  Order FAILED: {exc}")
         raise
 
-    logger.info(
-        "LIMIT order placed — orderId=%s status=%s",
-        resp.get("orderId"),
-        resp.get("status"),
-    )
-    _print_order_response(resp)
-    print("\n✔  Order placed successfully!")
+    logger.info("STOP_LIMIT order placed — orderId=%s status=%s", resp.get("orderId"), resp.get("status"))
+    _print_block("STOP-LIMIT ORDER RESPONSE", _response_rows(resp))
+    print("\n✔  Stop-Limit order placed successfully!")
     return resp
 
 
-def place_stop_market_order(
+# ---------------------------------------------------------------------------
+# 2. OCO  (One-Cancels-the-Other)
+# ---------------------------------------------------------------------------
+
+
+def place_oco_order(
     client: BinanceClient,
     symbol: str,
     side: str,
     quantity: Decimal,
+    price: Decimal,
     stop_price: Decimal,
+    stop_limit_price: Decimal,
+    time_in_force: str = "GTC",
 ) -> Dict[str, Any]:
     """
-    Place a STOP_MARKET order (bonus order type) on Binance Futures Testnet.
+    OCO order: a LIMIT order + a STOP-LIMIT order. Cancelling one cancels
+    the other. Uses the Binance /fapi/v1/order/oco endpoint.
 
     Args:
-        client:     Authenticated BinanceClient instance.
-        symbol:     Trading pair, e.g. "BTCUSDT".
-        side:       "BUY" or "SELL".
-        quantity:   Order quantity (base asset).
-        stop_price: Trigger price for the stop.
-
-    Returns:
-        Raw order response dict from the API.
+        price:            Take-profit limit price.
+        stop_price:       Stop trigger price.
+        stop_limit_price: Limit price after stop is triggered.
     """
     params: Dict[str, Any] = {
-        "symbol":    symbol,
-        "side":      side,
-        "type":      "STOP_MARKET",
-        "quantity":  str(quantity),
-        "stopPrice": str(stop_price),
+        "symbol":           symbol,
+        "side":             side,
+        "quantity":         str(quantity),
+        "price":            str(price),
+        "stopPrice":        str(stop_price),
+        "stopLimitPrice":   str(stop_limit_price),
+        "stopLimitTimeInForce": time_in_force,
     }
 
     logger.info(
-        "Placing STOP_MARKET order — %s %s qty=%s stopPrice=%s",
-        side, symbol, quantity, stop_price,
+        "Placing OCO order — %s %s qty=%s price=%s stopPrice=%s stopLimitPrice=%s",
+        side, symbol, quantity, price, stop_price, stop_limit_price,
     )
-    _print_order_summary(params)
+    _print_block("OCO ORDER REQUEST", [
+        ("symbol",           symbol),
+        ("side",             side),
+        ("quantity",         quantity),
+        ("take-profit price",price),
+        ("stop trigger",     stop_price),
+        ("stop limit price", stop_limit_price),
+        ("timeInForce",      time_in_force),
+    ])
 
     try:
-        resp = client.place_order(**params)
+        resp = client.place_order_raw("POST", "/fapi/v1/order/oco", params)
     except BinanceClientError as exc:
-        logger.error("STOP_MARKET order failed — %s", exc)
+        logger.error("OCO order failed — %s", exc)
         print(f"\n✗  Order FAILED: {exc}")
         raise
 
-    logger.info(
-        "STOP_MARKET order placed — orderId=%s status=%s",
-        resp.get("orderId"),
-        resp.get("status"),
-    )
-    _print_order_response(resp)
-    print("\n✔  Order placed successfully!")
+    # OCO response has an 'orderReports' list
+    order_list_id = resp.get("orderListId", "—")
+    reports = resp.get("orderReports", [])
+    logger.info("OCO order placed — orderListId=%s orders=%d", order_list_id, len(reports))
+
+    _print_block("OCO ORDER RESPONSE", [
+        ("orderListId",  order_list_id),
+        ("contingencyType", resp.get("contingencyType", "—")),
+        ("listStatusType",  resp.get("listStatusType",  "—")),
+        ("listOrderStatus", resp.get("listOrderStatus", "—")),
+    ])
+    for i, r in enumerate(reports, 1):
+        print(f"\n  — Leg {i}: orderId={r.get('orderId')}  type={r.get('type')}  status={r.get('status')}")
+
+    print("\n✔  OCO order placed successfully!")
     return resp
+
+
+# ---------------------------------------------------------------------------
+# 3. TWAP  (Time-Weighted Average Price)
+# ---------------------------------------------------------------------------
+
+
+def place_twap_order(
+    client: BinanceClient,
+    symbol: str,
+    side: str,
+    total_quantity: Decimal,
+    slices: int,
+    interval_seconds: int,
+    order_type: str = "MARKET",
+    price: Optional[Decimal] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Naive TWAP: splits `total_quantity` into `slices` equal child orders
+    placed `interval_seconds` apart.
+
+    Args:
+        slices:           Number of child orders.
+        interval_seconds: Delay between child orders (seconds).
+        order_type:       "MARKET" (default) or "LIMIT" per slice.
+        price:            Required when order_type="LIMIT".
+
+    Returns:
+        List of raw order response dicts, one per slice.
+    """
+    if slices < 2:
+        raise ValueError("TWAP requires at least 2 slices.")
+    if interval_seconds < 1:
+        raise ValueError("Interval must be at least 1 second.")
+
+    slice_qty = (total_quantity / Decimal(slices)).quantize(Decimal("0.00001"))
+
+    logger.info(
+        "Starting TWAP — %s %s totalQty=%s slices=%d interval=%ds",
+        side, symbol, total_quantity, slices, interval_seconds,
+    )
+    _print_block("TWAP ORDER PLAN", [
+        ("symbol",        symbol),
+        ("side",          side),
+        ("total quantity",total_quantity),
+        ("slices",        slices),
+        ("qty per slice", slice_qty),
+        ("interval",      f"{interval_seconds}s"),
+        ("child type",    order_type),
+        ("limit price",   price if price else "—"),
+        ("est. duration", f"{(slices - 1) * interval_seconds}s"),
+    ])
+
+    responses: List[Dict[str, Any]] = []
+
+    for i in range(1, slices + 1):
+        print(f"\n  ▶  Slice {i}/{slices}  qty={slice_qty} …", end=" ", flush=True)
+        logger.info("TWAP slice %d/%d — qty=%s", i, slices, slice_qty)
+
+        params: Dict[str, Any] = {
+            "symbol":   symbol,
+            "side":     side,
+            "type":     order_type,
+            "quantity": str(slice_qty),
+        }
+        if order_type == "LIMIT" and price:
+            params["price"] = str(price)
+            params["timeInForce"] = "GTC"
+
+        try:
+            resp = client.place_order(**params)
+            responses.append(resp)
+            status = resp.get("status", "?")
+            print(f"orderId={resp.get('orderId')}  status={status}")
+            logger.info("TWAP slice %d placed — orderId=%s status=%s", i, resp.get("orderId"), status)
+        except BinanceClientError as exc:
+            logger.error("TWAP slice %d failed — %s", i, exc)
+            print(f"FAILED ({exc})")
+            # Continue remaining slices rather than aborting the whole TWAP
+            responses.append({"error": str(exc), "slice": i})
+
+        if i < slices:
+            time.sleep(interval_seconds)
+
+    placed = sum(1 for r in responses if "orderId" in r)
+    print(f"\n✔  TWAP complete — {placed}/{slices} slices placed successfully.")
+    logger.info("TWAP finished — %d/%d slices succeeded", placed, slices)
+    return responses
+
+
+# ---------------------------------------------------------------------------
+# 4. Grid
+# ---------------------------------------------------------------------------
+
+
+def place_grid_order(
+    client: BinanceClient,
+    symbol: str,
+    side: str,
+    quantity_per_level: Decimal,
+    levels: int,
+    start_price: Decimal,
+    step: Decimal,
+    time_in_force: str = "GTC",
+) -> List[Dict[str, Any]]:
+    """
+    Grid strategy: place `levels` LIMIT orders evenly spaced by `step`.
+
+    BUY grid  — prices step DOWN from start_price (accumulate on dips).
+    SELL grid — prices step UP   from start_price (distribute on rallies).
+
+    Args:
+        levels:            Number of grid levels.
+        start_price:       First grid price.
+        step:              Price increment between levels (always positive).
+        quantity_per_level:Quantity for each grid order.
+    """
+    if levels < 2:
+        raise ValueError("Grid requires at least 2 levels.")
+    if step <= 0:
+        raise ValueError("Grid step must be positive.")
+
+    direction = -1 if side.upper() == "BUY" else 1
+    prices = [start_price + direction * step * i for i in range(levels)]
+
+    logger.info(
+        "Starting GRID — %s %s levels=%d start=%s step=%s",
+        side, symbol, levels, start_price, step,
+    )
+    _print_block("GRID ORDER PLAN", [
+        ("symbol",         symbol),
+        ("side",           side),
+        ("levels",         levels),
+        ("qty/level",      quantity_per_level),
+        ("start price",    start_price),
+        ("step",           step),
+        ("price range",    f"{min(prices)} → {max(prices)}"),
+        ("total quantity", quantity_per_level * levels),
+    ])
+
+    responses: List[Dict[str, Any]] = []
+
+    for i, p in enumerate(prices, 1):
+        print(f"\n  ▶  Level {i}/{levels}  price={p}  qty={quantity_per_level} …", end=" ", flush=True)
+        logger.info("Grid level %d/%d — price=%s qty=%s", i, levels, p, quantity_per_level)
+
+        params: Dict[str, Any] = {
+            "symbol":      symbol,
+            "side":        side,
+            "type":        "LIMIT",
+            "quantity":    str(quantity_per_level),
+            "price":       str(p),
+            "timeInForce": time_in_force,
+        }
+
+        try:
+            resp = client.place_order(**params)
+            responses.append(resp)
+            print(f"orderId={resp.get('orderId')}  status={resp.get('status')}")
+            logger.info("Grid level %d placed — orderId=%s", i, resp.get("orderId"))
+        except BinanceClientError as exc:
+            logger.error("Grid level %d failed — %s", i, exc)
+            print(f"FAILED ({exc})")
+            responses.append({"error": str(exc), "level": i, "price": str(p)})
+
+    placed = sum(1 for r in responses if "orderId" in r)
+    print(f"\n✔  Grid complete — {placed}/{levels} levels placed successfully.")
+    logger.info("Grid finished — %d/%d levels succeeded", placed, levels)
+    return responses

@@ -1,92 +1,123 @@
 """
-Input validation for trading bot CLI arguments.
-All validation raises ValueError with a human-readable message on failure.
+bot/credentials.py — Persistent API credential storage.
+
+Credentials are saved to ~/.trading_bot/credentials.json.
+The secret is obfuscated with a machine-specific key (not true encryption,
+but prevents casual shoulder-surfing of the file).  Users who need stronger
+security should use environment variables instead.
+
+Priority order when loading:
+  1. Environment variables  (BINANCE_API_KEY / BINANCE_API_SECRET)
+  2. Saved credentials file (~/.trading_bot/credentials.json)
+  3. Not found → returns (None, None)
 """
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
-from typing import Optional
+import base64
+import hashlib
+import json
+import os
+import uuid
+from pathlib import Path
+from typing import Optional, Tuple
+
+# Config directory lives in the user's home folder, not the project dir
+_CONFIG_DIR  = Path.home() / ".trading_bot"
+_CONFIG_FILE = _CONFIG_DIR / "credentials.json"
 
 
-VALID_SIDES = {"BUY", "SELL"}
-VALID_ORDER_TYPES = {"MARKET", "LIMIT", "STOP_MARKET", "STOP_LIMIT", "OCO", "TWAP", "GRID"}
+# ---------------------------------------------------------------------------
+# Machine-specific obfuscation key (not cryptographic — just avoids plaintext)
+# ---------------------------------------------------------------------------
+
+def _machine_key() -> bytes:
+    """Derive a stable bytes key from a machine identifier."""
+    node = str(uuid.getnode())          # MAC address as integer string
+    home = str(Path.home())
+    raw  = f"{node}:{home}:trading_bot_v1"
+    return hashlib.sha256(raw.encode()).digest()
 
 
-def validate_symbol(symbol: str) -> str:
-    """Return upper-cased symbol or raise ValueError."""
-    symbol = symbol.strip().upper()
-    if not symbol or not symbol.isalnum():
-        raise ValueError(f"Invalid symbol '{symbol}'. Must be alphanumeric, e.g. BTCUSDT.")
-    return symbol
+def _xor(data: bytes, key: bytes) -> bytes:
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
 
-def validate_side(side: str) -> str:
-    """Return upper-cased side or raise ValueError."""
-    side = side.strip().upper()
-    if side not in VALID_SIDES:
-        raise ValueError(f"Invalid side '{side}'. Must be one of: {', '.join(sorted(VALID_SIDES))}.")
-    return side
+def _encode(plaintext: str) -> str:
+    obfuscated = _xor(plaintext.encode(), _machine_key())
+    return base64.b64encode(obfuscated).decode()
 
 
-def validate_order_type(order_type: str) -> str:
-    """Return upper-cased order type or raise ValueError."""
-    order_type = order_type.strip().upper()
-    if order_type not in VALID_ORDER_TYPES:
-        raise ValueError(
-            f"Invalid order type '{order_type}'. Must be one of: {', '.join(sorted(VALID_ORDER_TYPES))}."
-        )
-    return order_type
+def _decode(encoded: str) -> str:
+    obfuscated = base64.b64decode(encoded.encode())
+    return _xor(obfuscated, _machine_key()).decode()
 
 
-def validate_quantity(quantity: str | float) -> Decimal:
-    """Return positive Decimal quantity or raise ValueError."""
-    try:
-        qty = Decimal(str(quantity))
-    except InvalidOperation:
-        raise ValueError(f"Invalid quantity '{quantity}'. Must be a positive number.")
-    if qty <= 0:
-        raise ValueError(f"Quantity must be > 0, got {qty}.")
-    return qty
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-
-def validate_price(price: Optional[str | float], order_type: str) -> Optional[Decimal]:
+def load_credentials() -> Tuple[Optional[str], Optional[str]]:
     """
-    Validate price depending on order type.
-    - LIMIT / STOP_MARKET: price is required and must be positive.
-    - MARKET: price is ignored (returns None).
+    Load credentials using the priority chain:
+      1. Environment variables
+      2. Saved config file
+      3. (None, None)
     """
-    order_type = order_type.strip().upper()
+    # 1. Env vars
+    env_key    = os.environ.get("BINANCE_API_KEY",    "").strip()
+    env_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+    if env_key and env_secret:
+        return env_key, env_secret
 
-    if order_type == "MARKET":
-        return None  # price not applicable
+    # 2. Config file
+    if _CONFIG_FILE.exists():
+        try:
+            data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+            key    = _decode(data["api_key"])
+            secret = _decode(data["api_secret"])
+            if key and secret:
+                return key, secret
+        except Exception:
+            pass  # corrupt file → fall through
 
-    if price is None or str(price).strip() == "":
-        raise ValueError(f"Price is required for {order_type} orders.")
-
-    try:
-        p = Decimal(str(price))
-    except InvalidOperation:
-        raise ValueError(f"Invalid price '{price}'. Must be a positive number.")
-    if p <= 0:
-        raise ValueError(f"Price must be > 0, got {p}.")
-    return p
+    return None, None
 
 
-def validate_stop_price(stop_price: Optional[str | float], order_type: str) -> Optional[Decimal]:
+def save_credentials(api_key: str, api_secret: str) -> None:
     """
-    Validate stop price — only required for STOP_MARKET orders.
+    Persist credentials to ~/.trading_bot/credentials.json.
+    The directory is created with mode 700; the file with mode 600.
     """
-    if order_type.upper() != "STOP_MARKET":
-        return None
+    _CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    if stop_price is None or str(stop_price).strip() == "":
-        raise ValueError("Stop price is required for STOP_MARKET orders.")
+    payload = {
+        "api_key":    _encode(api_key.strip()),
+        "api_secret": _encode(api_secret.strip()),
+    }
+    _CONFIG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _CONFIG_FILE.chmod(0o600)
 
-    try:
-        sp = Decimal(str(stop_price))
-    except InvalidOperation:
-        raise ValueError(f"Invalid stop price '{stop_price}'. Must be a positive number.")
-    if sp <= 0:
-        raise ValueError(f"Stop price must be > 0, got {sp}.")
-    return sp
+
+def clear_credentials() -> bool:
+    """Delete saved credentials. Returns True if a file was removed."""
+    if _CONFIG_FILE.exists():
+        _CONFIG_FILE.unlink()
+        return True
+    return False
+
+
+def credentials_exist() -> bool:
+    """Return True if saved (non-env) credentials are present on disk."""
+    return _CONFIG_FILE.exists()
+
+
+def credentials_source() -> str:
+    """Return a human-readable string describing where credentials came from."""
+    env_key    = os.environ.get("BINANCE_API_KEY",    "").strip()
+    env_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+    if env_key and env_secret:
+        return "environment variables"
+    if _CONFIG_FILE.exists():
+        return f"saved config ({_CONFIG_FILE})"
+    return "not configured"

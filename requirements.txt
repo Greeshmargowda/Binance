@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Bot · Binance Futures Testnet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #090c0f;
+    --bg2:      #0e1318;
+    --bg3:      #131a21;
+    --border:   #1e2d3a;
+    --border2:  #243547;
+    --text:     #c8d8e8;
+    --text-dim: #4a6070;
+    --text-mid: #7a9ab0;
+    --accent:   #00d4aa;
+    --accent2:  #00a8ff;
+    --buy:      #00d4aa;
+    --sell:     #ff4f6a;
+    --warn:     #f0a500;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow-x: hidden;
+  }
+
+  /* ── Scanline overlay ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,.07) 2px, rgba(0,0,0,.07) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    height: 52px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 12px; font-weight: 600; letter-spacing: .12em; color: var(--accent);
+    text-transform: uppercase;
+  }
+  .logo-hex { font-size: 20px; }
+  .badge {
+    padding: 2px 8px;
+    background: rgba(0,212,170,.08);
+    border: 1px solid rgba(0,212,170,.25);
+    border-radius: 2px;
+    font-size: 10px; letter-spacing: .1em;
+    color: var(--accent);
+  }
+  #conn-status {
+    font-size: 11px; color: var(--text-dim);
+    display: flex; align-items: center; gap: 6px;
+  }
+  #conn-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--text-dim);
+    transition: background .4s;
+  }
+  #conn-dot.live { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+  /* ── Layout ── */
+  main {
+    display: grid;
+    grid-template-columns: 260px 1fr 340px;
+    gap: 0;
+    height: calc(100vh - 52px);
+  }
+
+  /* ── Panel base ── */
+  .panel {
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    overflow-y: auto;
+  }
+  .panel:last-child { border-right: none; }
+  .panel-title {
+    padding: 14px 18px 10px;
+    font-size: 10px; font-weight: 600; letter-spacing: .15em;
+    color: var(--text-dim); text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+  }
+
+  /* ── Left: Type selector ── */
+  #type-panel { background: var(--bg2); }
+  .type-list { padding: 8px 0; }
+  .type-item {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px 18px;
+    cursor: pointer;
+    transition: background .15s;
+    border-left: 2px solid transparent;
+  }
+  .type-item:hover  { background: rgba(255,255,255,.03); }
+  .type-item.active {
+    background: rgba(0,212,170,.06);
+    border-left-color: var(--accent);
+  }
+  .type-item.active .type-key { color: var(--accent); }
+  .type-key  { font-weight: 600; font-size: 12px; color: var(--text-mid); min-width: 72px; }
+  .type-desc { font-size: 11px; color: var(--text-dim); line-height: 1.4; margin-top: 1px; }
+
+  /* ── Middle: Form ── */
+  #form-panel { background: var(--bg); }
+  .form-body { padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label {
+    font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--text-dim); font-weight: 600;
+  }
+  .field input, .field select {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 9px 12px;
+    border-radius: 3px;
+    outline: none;
+    transition: border-color .2s;
+    width: 100%;
+    appearance: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent2); }
+  .field input::placeholder { color: var(--text-dim); }
+  .field-hint { font-size: 10px; color: var(--text-dim); }
+
+  .side-toggle {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--border); border-radius: 3px; overflow: hidden;
+  }
+  .side-btn {
+    padding: 10px;
+    background: var(--bg3);
+    border: none;
+    font-family: var(--mono);
+    font-size: 12px; font-weight: 600;
+    letter-spacing: .1em;
+    cursor: pointer;
+    transition: background .2s, color .2s;
+    color: var(--text-dim);
+  }
+  .side-btn.buy.active  { background: rgba(0,212,170,.18); color: var(--buy); }
+  .side-btn.sell.active { background: rgba(255,79,106,.18); color: var(--sell); }
+
+  .submit-btn {
+    margin-top: 4px;
+    padding: 13px;
+    border: none;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 12px; font-weight: 600;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: opacity .2s, transform .1s;
+  }
+  .submit-btn:active { transform: scale(.98); }
+  .submit-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .submit-btn.buy  { background: var(--buy);  color: #000; }
+  .submit-btn.sell { background: var(--sell); color: #fff; }
+
+  /* Settings toggle */
+  #settings-toggle {
+    margin: 16px 22px 0;
+    padding: 8px 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: border-color .2s, color .2s;
+    text-align: left;
+    letter-spacing: .05em;
+  }
+  #settings-toggle:hover { border-color: var(--accent2); color: var(--accent2); }
+  #settings-section { padding: 14px 22px; display: none; border-bottom: 1px solid var(--border); }
+  #settings-section.open { display: block; }
+
+  /* ── Right: Log panel ── */
+  #log-panel { background: var(--bg2); }
+  #log-list { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+
+  .log-entry {
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    animation: slideIn .3s ease;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(-8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .log-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+  }
+  .log-tag {
+    font-size: 10px; font-weight: 600; letter-spacing: .1em;
+    padding: 2px 7px; border-radius: 2px;
+  }
+  .log-tag.ok   { background: rgba(0,212,170,.15); color: var(--accent); }
+  .log-tag.err  { background: rgba(255,79,106,.15); color: var(--sell); }
+  .log-tag.info { background: rgba(0,168,255,.15);  color: var(--accent2); }
+  .log-time { font-size: 10px; color: var(--text-dim); }
+  .log-body { padding: 10px 12px; }
+  .log-row  { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; font-size: 11px; }
+  .log-row:last-child { margin-bottom: 0; }
+  .log-key   { color: var(--text-dim); }
+  .log-val   { color: var(--text); text-align: right; word-break: break-all; }
+  .log-val.green { color: var(--buy); }
+  .log-val.red   { color: var(--sell); }
+
+  /* Dynamic fields */
+  .dynamic-fields { display: flex; flex-direction: column; gap: 16px; }
+
+  /* Spinner */
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid transparent;
+    border-top-color: currentColor;
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+    vertical-align: middle; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <span class="logo-hex">⬡</span>
+    <span>Trading Bot</span>
+    <span class="badge">TESTNET</span>
+  </div>
+  <div id="conn-status">
+    <span id="conn-dot"></span>
+    <span id="conn-text">Not connected</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- LEFT: Order type selector -->
+  <div class="panel" id="type-panel">
+    <div class="panel-title">Order Type</div>
+    <div class="type-list" id="type-list">
+      <div class="type-item active" data-type="MARKET">
+        <div><div class="type-key">MARKET</div><div class="type-desc">Instant execution at best price</div></div>
+      </div>
+      <div class="type-item" data-type="LIMIT">
+        <div><div class="type-key">LIMIT</div><div class="type-desc">Fill at a specific price or better</div></div>
+      </div>
+      <div class="type-item" data-type="STOP_MARKET">
+        <div><div class="type-key">STOP MKT</div><div class="type-desc">Market fill triggered at stop price</div></div>
+      </div>
+      <div class="type-item" data-type="STOP_LIMIT">
+        <div><div class="type-key">STOP LMT</div><div class="type-desc">Limit fill triggered at stop price</div></div>
+      </div>
+      <div class="type-item" data-type="OCO">
+        <div><div class="type-key">OCO</div><div class="type-desc">Take-profit + stop-loss linked pair</div></div>
+      </div>
+      <div class="type-item" data-type="TWAP">
+        <div><div class="type-key">TWAP</div><div class="type-desc">Slice large order over time</div></div>
+      </div>
+      <div class="type-item" data-type="GRID">
+        <div><div class="type-key">GRID</div><div class="type-desc">Ladder of limit orders at spaced levels</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MIDDLE: Form -->
+  <div class="panel" id="form-panel">
+    <div class="panel-title" id="form-title">Market Order</div>
+
+    <!-- Settings -->
+    <button id="settings-toggle">⚙ API Credentials</button>
+    <div id="settings-section">
+      <div id="cred-source-banner" style="display:none;margin-bottom:12px;padding:8px 12px;border-radius:3px;font-size:11px;background:rgba(0,212,170,.08);border:1px solid rgba(0,212,170,.2);color:var(--accent)"></div>
+      <div class="field" style="margin-bottom:10px">
+        <label>API Key</label>
+        <input type="text" id="api-key" placeholder="Testnet API key">
+      </div>
+      <div class="field" style="margin-bottom:10px">
+        <label>API Secret</label>
+        <input type="password" id="api-secret" placeholder="Testnet API secret">
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:11px;color:var(--text-mid);cursor:pointer">
+        <input type="checkbox" id="save-creds" checked style="accent-color:var(--accent);width:14px;height:14px">
+        Save credentials to disk (auto-load next session)
+      </label>
+      <div style="display:flex;gap:8px">
+        <button class="submit-btn buy" style="background:var(--accent2);flex:1" onclick="saveCredentials()">Connect &amp; Save</button>
+        <button class="submit-btn sell" style="flex:0 0 auto;padding:13px 16px;font-size:11px" onclick="clearCredentials()" title="Delete saved credentials from disk">✕ Clear</button>
+      </div>
+    </div>
+
+    <div class="form-body">
+      <!-- Common fields -->
+      <div class="field">
+        <label>Symbol</label>
+        <input type="text" id="symbol" placeholder="BTCUSDT" value="BTCUSDT">
+      </div>
+      <div class="field">
+        <label>Side</label>
+        <div class="side-toggle">
+          <button class="side-btn buy active" id="btn-buy"  onclick="setSide('BUY')">BUY</button>
+          <button class="side-btn sell"       id="btn-sell" onclick="setSide('SELL')">SELL</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Quantity</label>
+        <input type="number" id="quantity" placeholder="0.001" step="0.001" min="0">
+      </div>
+
+      <!-- Dynamic fields injected by JS -->
+      <div class="dynamic-fields" id="dynamic-fields"></div>
+
+      <button class="submit-btn buy" id="submit-btn" onclick="submitOrder()">
+        Place Market Order
+      </button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Activity log -->
+  <div class="panel" id="log-panel">
+    <div class="panel-title">Activity Log</div>
+    <div id="log-list">
+      <div class="log-entry">
+        <div class="log-header">
+          <span class="log-tag info">INFO</span>
+          <span class="log-time">Ready</span>
+        </div>
+        <div class="log-body">
+          <div class="log-row"><span class="log-key">status</span><span class="log-val">Configure credentials to begin</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let currentType = 'MARKET';
+let currentSide = 'BUY';
+let connected   = false;
+
+// ── Type selector ──────────────────────────────────────────────────────────
+document.querySelectorAll('.type-item').forEach(el => {
+  el.addEventListener('click', () => {
+    document.querySelectorAll('.type-item').forEach(x => x.classList.remove('active'));
+    el.classList.add('active');
+    currentType = el.dataset.type;
+    renderDynamicFields();
+    updateSubmitBtn();
+    document.getElementById('form-title').textContent = typeLabel(currentType);
+  });
+});
+
+function typeLabel(t) {
+  const map = {
+    MARKET:'Market Order', LIMIT:'Limit Order', STOP_MARKET:'Stop-Market Order',
+    STOP_LIMIT:'Stop-Limit Order', OCO:'OCO Order', TWAP:'TWAP Order', GRID:'Grid Order'
+  };
+  return map[t] || t;
+}
+
+// ── Side toggle ────────────────────────────────────────────────────────────
+function setSide(side) {
+  currentSide = side;
+  document.getElementById('btn-buy').classList.toggle('active',  side === 'BUY');
+  document.getElementById('btn-sell').classList.toggle('active', side === 'SELL');
+  updateSubmitBtn();
+}
+
+function updateSubmitBtn() {
+  const btn = document.getElementById('submit-btn');
+  const label = currentSide === 'BUY' ? 'Buy' : 'Sell';
+  btn.textContent = `${label} · ${typeLabel(currentType)}`;
+  btn.className = `submit-btn ${currentSide === 'BUY' ? 'buy' : 'sell'}`;
+}
+
+// ── Dynamic fields ─────────────────────────────────────────────────────────
+const fieldDefs = {
+  price:           { label: 'Limit Price',        type: 'number', placeholder: 'e.g. 95000',  id: 'price' },
+  stop_price:      { label: 'Stop Price',          type: 'number', placeholder: 'e.g. 94000',  id: 'stop_price' },
+  stop_limit_price:{ label: 'Stop Limit Price',    type: 'number', placeholder: 'e.g. 93800',  id: 'stop_limit_price' },
+  time_in_force:   { label: 'Time in Force',       type: 'select', options: ['GTC','IOC','FOK'], id: 'time_in_force' },
+  slices:          { label: 'Slices',              type: 'number', placeholder: '5',            id: 'slices', min: 2, step: 1 },
+  interval:        { label: 'Interval (seconds)',  type: 'number', placeholder: '10',           id: 'interval', min: 1, step: 1 },
+  child_type:      { label: 'Child Order Type',    type: 'select', options: ['MARKET','LIMIT'], id: 'child_type' },
+  levels:          { label: 'Grid Levels',         type: 'number', placeholder: '5',            id: 'levels', min: 2, step: 1 },
+  start_price:     { label: 'Start Price',         type: 'number', placeholder: 'e.g. 95000',  id: 'start_price' },
+  step:            { label: 'Step (price gap)',     type: 'number', placeholder: 'e.g. 500',    id: 'step' },
+};
+
+const typeFields = {
+  MARKET:      [],
+  LIMIT:       ['price', 'time_in_force'],
+  STOP_MARKET: ['stop_price'],
+  STOP_LIMIT:  ['stop_price', 'price', 'time_in_force'],
+  OCO:         ['price', 'stop_price', 'stop_limit_price'],
+  TWAP:        ['slices', 'interval', 'child_type'],
+  GRID:        ['levels', 'start_price', 'step'],
+};
+
+function renderDynamicFields() {
+  const container = document.getElementById('dynamic-fields');
+  const fields = typeFields[currentType] || [];
+  container.innerHTML = fields.map(f => {
+    const d = fieldDefs[f];
+    if (d.type === 'select') {
+      const opts = d.options.map(o => `<option>${o}</option>`).join('');
+      return `<div class="field"><label>${d.label}</label><select id="${d.id}">${opts}</select></div>`;
+    }
+    const extras = d.min  !== undefined ? `min="${d.min}"` : '';
+    const step   = d.step !== undefined ? `step="${d.step}"` : 'step="any"';
+    return `<div class="field"><label>${d.label}</label><input type="${d.type}" id="${d.id}" placeholder="${d.placeholder}" ${extras} ${step}></div>`;
+  }).join('');
+}
+
+// ── Credentials ────────────────────────────────────────────────────────────
+document.getElementById('settings-toggle').addEventListener('click', () => {
+  document.getElementById('settings-section').classList.toggle('open');
+});
+
+async function checkSavedCredentials() {
+  // On page load, check if credentials are already saved/in env
+  try {
+    const res  = await fetch('/api/credentials');
+    const data = await res.json();
+    if (data.status === 'ok' && data.data.configured) {
+      // Try connecting silently
+      const pingRes  = await fetch('/api/credentials', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({api_key: '', api_secret: '', save: false}),
+      });
+      const pingData = await pingRes.json();
+      if (pingData.status === 'ok') {
+        markConnected(pingData.data.source, pingData.data.server_time);
+        showCredBanner(`Auto-connected from: ${data.data.source}`);
+        return;
+      }
+    }
+  } catch(e) {}
+  // Not connected yet — open settings
+  document.getElementById('settings-section').classList.add('open');
+}
+
+function markConnected(source, serverTime) {
+  connected = true;
+  document.getElementById('conn-dot').classList.add('live');
+  document.getElementById('conn-text').textContent = 'Connected · Testnet';
+  document.getElementById('settings-section').classList.remove('open');
+  addLog('ok', 'Connected', {source: source || 'configured', server_time: serverTime || '—'});
+}
+
+function showCredBanner(msg) {
+  const banner = document.getElementById('cred-source-banner');
+  banner.textContent = '✔ ' + msg;
+  banner.style.display = 'block';
+}
+
+async function saveCredentials() {
+  const key    = document.getElementById('api-key').value.trim();
+  const secret = document.getElementById('api-secret').value.trim();
+  const save   = document.getElementById('save-creds').checked;
+
+  if (!key || !secret) { addLog('error', 'Credentials', {error: 'Both API key and secret are required'}); return; }
+
+  addLog('info', 'Connecting…', {api_key: key.slice(0,8)+'…', save_to_disk: save});
+  const res  = await fetch('/api/credentials', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({api_key: key, api_secret: secret, save}),
+  });
+  const data = await res.json();
+  if (data.status === 'ok') {
+    const savedMsg = save ? ' · saved to disk' : ' · session only';
+    markConnected(data.data.source, data.data.server_time);
+    showCredBanner((save ? 'Credentials saved — will auto-load next time' : 'Connected for this session only'));
+    addLog('ok', 'Connected' + savedMsg, {server_time: data.data.server_time});
+  } else {
+    addLog('error', 'Connection failed', {error: data.message});
+  }
+}
+
+async function clearCredentials() {
+  if (!confirm('Delete saved credentials from disk?')) return;
+  const res  = await fetch('/api/credentials', {method: 'DELETE'});
+  const data = await res.json();
+  connected  = false;
+  document.getElementById('conn-dot').classList.remove('live');
+  document.getElementById('conn-text').textContent = 'Not connected';
+  document.getElementById('api-key').value    = '';
+  document.getElementById('api-secret').value = '';
+  document.getElementById('cred-source-banner').style.display = 'none';
+  addLog('info', 'Credentials cleared', {disk: data.data?.cleared ? 'deleted' : 'none found'});
+}
+
+// ── Submit ─────────────────────────────────────────────────────────────────
+async function submitOrder() {
+  if (!connected) {
+    addLog('error', 'Not connected', {hint: 'Open API Credentials and click Connect first'});
+    return;
+  }
+
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Placing order…';
+
+  const payload = {
+    symbol:     document.getElementById('symbol').value.trim().toUpperCase(),
+    side:       currentSide,
+    order_type: currentType,
+    quantity:   document.getElementById('quantity').value,
+  };
+
+  // Collect dynamic fields
+  (typeFields[currentType] || []).forEach(f => {
+    const el = document.getElementById(f);
+    if (el) payload[f] = el.value;
+  });
+
+  addLog('info', `${currentType} · ${currentSide}`, {
+    symbol: payload.symbol, qty: payload.quantity, type: currentType,
+  });
+
+  const res  = await fetch('/api/order', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+
+  btn.disabled = false;
+  updateSubmitBtn();
+
+  if (data.status === 'ok') {
+    const r = Array.isArray(data.data) ? data.data[0] : data.data;
+    const rows = {};
+    if (r) {
+      if (r.orderId)    rows.orderId    = r.orderId;
+      if (r.status)     rows.status     = r.status;
+      if (r.executedQty && r.executedQty !== '0') rows.executedQty = r.executedQty;
+      if (r.avgPrice && r.avgPrice !== '0' && r.avgPrice !== '0.00000000') rows.avgPrice = r.avgPrice;
+      if (r.price && r.price !== '0' && r.price !== '0.00000000') rows.price = r.price;
+    }
+    if (Array.isArray(data.data)) rows['slices/levels'] = data.data.length;
+    addLog('ok', `${currentType} placed`, rows);
+  } else {
+    addLog('error', `${currentType} failed`, {error: data.message});
+  }
+}
+
+// ── Log panel ──────────────────────────────────────────────────────────────
+function addLog(tag, title, rows) {
+  const list = document.getElementById('log-list');
+  const now  = new Date().toLocaleTimeString();
+  const rowsHtml = Object.entries(rows).map(([k, v]) => {
+    const cls = (k === 'status' && v === 'FILLED') ? 'green'
+              : (k === 'error') ? 'red' : '';
+    return `<div class="log-row"><span class="log-key">${k}</span><span class="log-val ${cls}">${v}</span></div>`;
+  }).join('');
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `
+    <div class="log-header">
+      <span class="log-tag ${tag}">${tag.toUpperCase()}</span>
+      <span class="log-time">${now}</span>
+    </div>
+    <div class="log-body">${rowsHtml}</div>
+  `;
+  list.prepend(entry);
+
+  // Keep last 30 entries
+  while (list.children.length > 30) list.removeChild(list.lastChild);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+renderDynamicFields();
+updateSubmitBtn();
+checkSavedCredentials();
+</script>
+</body>
+</html>
